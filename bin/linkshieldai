@@ -1,0 +1,115 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use LinkShieldAI\Client;
+use LinkShieldAI\Exception\LinkShieldAIException;
+
+require __DIR__ . '/../vendor/autoload.php';
+
+function usage(): string
+{
+    return <<<TEXT
+Usage:
+  linkshieldai [--api-key KEY] [--base-url URL] [--timeout SECONDS] [--max-retries N] basic <url>
+  linkshieldai [--api-key KEY] [--base-url URL] [--timeout SECONDS] [--max-retries N] detailed <url>
+  linkshieldai [--api-key KEY] [--base-url URL] [--timeout SECONDS] [--max-retries N] nsfw <url>
+  linkshieldai [--api-key KEY] [--base-url URL] [--timeout SECONDS] [--max-retries N] chimera <url>
+  linkshieldai [--api-key KEY] [--base-url URL] [--timeout SECONDS] [--max-retries N] screenshot <fileOrUrl> --output <path>
+TEXT;
+}
+
+/**
+ * @return array{command: ?string, apiKey: ?string, baseUrl: string, timeout: float, maxRetries: int, output: ?string, target: ?string, help: bool}
+ */
+function parse_args(array $argv): array
+{
+    $args = [
+        'command' => null,
+        'apiKey' => null,
+        'baseUrl' => Client::DEFAULT_BASE_URL,
+        'timeout' => 10.0,
+        'maxRetries' => 2,
+        'output' => null,
+        'target' => null,
+        'help' => false,
+    ];
+    $positionals = [];
+
+    for ($i = 1; $i < count($argv); $i++) {
+        $arg = $argv[$i];
+        $next = $argv[$i + 1] ?? null;
+        if ($arg === '--help' || $arg === '-h') {
+            $args['help'] = true;
+        } elseif ($arg === '--api-key') {
+            $args['apiKey'] = $next;
+            $i++;
+        } elseif ($arg === '--base-url') {
+            $args['baseUrl'] = $next ?? Client::DEFAULT_BASE_URL;
+            $i++;
+        } elseif ($arg === '--timeout') {
+            $args['timeout'] = (float) $next;
+            $i++;
+        } elseif ($arg === '--max-retries') {
+            $args['maxRetries'] = (int) $next;
+            $i++;
+        } elseif ($arg === '--output' || $arg === '-o') {
+            $args['output'] = $next;
+            $i++;
+        } else {
+            $positionals[] = $arg;
+        }
+    }
+
+    $args['command'] = $positionals[0] ?? null;
+    $args['target'] = $positionals[1] ?? null;
+    return $args;
+}
+
+function print_json(mixed $value): void
+{
+    echo json_encode($value, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL;
+}
+
+$args = parse_args($argv);
+if ($args['help'] || !$args['command']) {
+    echo usage() . PHP_EOL;
+    exit($args['help'] ? 0 : 2);
+}
+
+try {
+    $client = new Client(
+        apiKey: $args['apiKey'],
+        baseUrl: $args['baseUrl'],
+        timeout: $args['timeout'],
+        maxRetries: $args['maxRetries'],
+    );
+
+    $command = $args['command'];
+    $target = $args['target'];
+    if (!$target) {
+        throw new InvalidArgumentException('Missing URL or screenshot file.');
+    }
+
+    $result = match ($command) {
+        'basic' => $client->basicCheck($target),
+        'detailed' => $client->detailedCheck($target),
+        'nsfw' => $client->nsfwCheck($target),
+        'chimera' => $client->chimera($target),
+        'screenshot' => (function () use ($client, $target, $args): array {
+            if (!$args['output']) {
+                throw new InvalidArgumentException('Missing --output path.');
+            }
+            $client->getScreenshot($target, $args['output']);
+            return ['saved' => $args['output']];
+        })(),
+        default => throw new InvalidArgumentException("Unknown command: {$command}"),
+    };
+
+    print_json($result);
+    exit(0);
+} catch (LinkShieldAIException | InvalidArgumentException $exception) {
+    fwrite(STDERR, json_encode(['error' => $exception->getMessage()], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL);
+    exit(1);
+}

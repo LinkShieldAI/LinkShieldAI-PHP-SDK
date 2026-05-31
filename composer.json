@@ -1,0 +1,46 @@
+{
+  "name": "linkshieldai/linkshieldai",
+  "description": "PHP SDK for the LinkShieldAI URL safety API.",
+  "type": "library",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "LinkShieldAI"
+    }
+  ],
+  "keywords": [
+    "linkshieldai",
+    "phishing",
+    "url-safety",
+    "security",
+    "sdk"
+  ],
+  "require": {
+    "php": ">=8.1"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^10.5"
+  },
+  "autoload": {
+    "psr-4": {
+      "LinkShieldAI\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "LinkShieldAI\\Tests\\": "tests/"
+    }
+  },
+  "bin": [
+    "bin/linkshieldai"
+  ],
+  "scripts": {
+    "test": "phpunit",
+    "check": [
+      "@test"
+    ]
+  },
+  "config": {
+    "sort-packages": true
+  }
+}
