@@ -6,7 +6,22 @@ declare(strict_types=1);
 use LinkShieldAI\Client;
 use LinkShieldAI\Exception\LinkShieldAIException;
 
-require __DIR__ . '/../vendor/autoload.php';
+$autoloadPaths = [
+    __DIR__ . '/../vendor/autoload.php',
+    __DIR__ . '/../../../autoload.php',
+];
+
+foreach ($autoloadPaths as $autoloadPath) {
+    if (is_file($autoloadPath)) {
+        require $autoloadPath;
+        break;
+    }
+}
+
+if (!class_exists(Client::class)) {
+    fwrite(STDERR, json_encode(['error' => 'Composer autoload file was not found. Run composer install or install this package through Composer.'], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL);
+    exit(1);
+}
 
 function usage(): string
 {
