@@ -40,26 +40,44 @@ final class Client
 
     public function basicCheck(string $url): BasicCheckResult
     {
-        $payload = $this->getJson('/', ['key' => $this->resolvedApiKey(), 'url' => $url]);
+        $payload = $this->getJson('/', ['url' => $url]);
         return $this->parseBasic($payload);
     }
 
     public function detailedCheck(string $url): DetailedCheckResult
     {
-        $payload = $this->getJson('/classify_link', ['key' => $this->resolvedApiKey(), 'url' => $url]);
+        $payload = $this->getJson('/classify_link', ['url' => $url]);
         return $this->parseDetailed($payload);
     }
 
     public function nsfwCheck(string $url): NsfwCheckResult
     {
-        $payload = $this->getJson('/nsfw/site', ['key' => $this->resolvedApiKey(), 'url' => $url]);
+        $payload = $this->getJson('/nsfw/site', ['url' => $url]);
         return $this->parseNsfw($payload);
     }
 
     public function chimera(string $url): ChimeraResult
     {
-        $payload = $this->getJson('/chimera', ['key' => $this->resolvedApiKey(), 'url' => $url]);
+        $payload = $this->getJson('/chimera', ['url' => $url]);
         return $this->parseChimera($payload);
+    }
+
+    /** @return array<string, mixed> Stable /v1/scan response. */
+    public function scan(string $url, string $mode = 'standard'): array
+    {
+        if (!in_array($mode, ['standard', 'detailed', 'deep'], true)) {
+            throw new \InvalidArgumentException('Scan mode must be standard, detailed, or deep.');
+        }
+        $body = json_encode(['url' => $url, 'mode' => $mode], JSON_THROW_ON_ERROR);
+        $response = $this->request('POST', '/v1/scan', [], [
+            'Authorization' => 'Bearer ' . $this->resolvedApiKey(),
+            'Content-Type' => 'application/json',
+        ], $body);
+        $payload = json_decode($response->body, true, flags: JSON_THROW_ON_ERROR);
+        if (!is_array($payload) || array_is_list($payload)) {
+            throw new ApiResponseException('LinkShieldAI API returned a non-object JSON response.', $payload);
+        }
+        return $payload;
     }
 
     public function isMalicious(string $url): bool
@@ -75,7 +93,9 @@ final class Client
     public function getScreenshot(string $fileNameOrUrl, ?string $outputPath = null): string
     {
         $fileName = $this->screenshotFileName($fileNameOrUrl);
-        $response = $this->request('GET', '/screenshot/' . rawurlencode($fileName));
+        $response = $this->request('GET', '/screenshot/' . rawurlencode($fileName), [], [
+            'Authorization' => 'Bearer ' . $this->resolvedApiKey(),
+        ]);
         $content = $response->body;
 
         if ($outputPath !== null) {
@@ -94,7 +114,7 @@ final class Client
      */
     private function getJson(string $path, array $params): array
     {
-        $response = $this->request('GET', $path, $params);
+        $response = $this->request('GET', $path, $params, ['Authorization' => 'Bearer ' . $this->resolvedApiKey()]);
         $payload = json_decode($response->body, true);
 
         if (json_last_error() !== JSON_ERROR_NONE) {
@@ -121,7 +141,7 @@ final class Client
     /**
      * @param array<string, string> $params
      */
-    private function request(string $method, string $path, array $params = []): HttpResponse
+    private function request(string $method, string $path, array $params = [], array $headers = [], ?string $body = null): HttpResponse
     {
         $url = rtrim($this->baseUrl, '/') . $path;
         if ($params !== []) {
@@ -131,7 +151,7 @@ final class Client
         $maxRetries = max(0, $this->maxRetries);
         for ($attempt = 0; $attempt <= $maxRetries; $attempt++) {
             try {
-                $response = $this->send($method, $url);
+                $response = $this->send($method, $url, $headers, $body);
             } catch (LinkShieldAIException $exception) {
                 throw $exception;
             } catch (\Throwable $exception) {
@@ -154,20 +174,20 @@ final class Client
         throw new ApiConnectionException('Could not connect to LinkShieldAI API after retries.');
     }
 
-    private function send(string $method, string $url): HttpResponse
+    private function send(string $method, string $url, array $headers = [], ?string $body = null): HttpResponse
     {
         if ($this->transport !== null) {
-            return ($this->transport)($method, $url, [], $this->timeout);
+            return ($this->transport)($method, $url, $headers, $this->timeout, $body);
         }
 
         if (function_exists('curl_init')) {
-            return $this->sendWithCurl($method, $url);
+            return $this->sendWithCurl($method, $url, $headers, $body);
         }
 
-        return $this->sendWithStream($method, $url);
+        return $this->sendWithStream($method, $url, $headers, $body);
     }
 
-    private function sendWithCurl(string $method, string $url): HttpResponse
+    private function sendWithCurl(string $method, string $url, array $requestHeaders = [], ?string $requestBody = null): HttpResponse
     {
         $headers = [];
         $handle = curl_init($url);
@@ -187,6 +207,8 @@ final class Client
                 return $length;
             },
             CURLOPT_TIMEOUT => $this->timeout,
+            CURLOPT_HTTPHEADER => array_map(static fn(string $name, string $value): string => $name . ': ' . $value, array_keys($requestHeaders), $requestHeaders),
+            CURLOPT_POSTFIELDS => $requestBody,
         ]);
 
         $body = curl_exec($handle);
@@ -202,13 +224,15 @@ final class Client
         return new HttpResponse($statusCode, (string) $body, $headers);
     }
 
-    private function sendWithStream(string $method, string $url): HttpResponse
+    private function sendWithStream(string $method, string $url, array $requestHeaders = [], ?string $requestBody = null): HttpResponse
     {
         $context = stream_context_create([
             'http' => [
                 'method' => $method,
                 'timeout' => $this->timeout,
                 'ignore_errors' => true,
+                'header' => implode("\r\n", array_map(static fn(string $name, string $value): string => $name . ': ' . $value, array_keys($requestHeaders), $requestHeaders)),
+                'content' => $requestBody ?? '',
             ],
         ]);
 
@@ -266,8 +290,11 @@ final class Client
     private function errorMessageFromPayload(?array $payload, string $fallback = 'LinkShieldAI API request failed.'): string
     {
         if ($payload !== null) {
+            if (isset($payload['error']) && is_array($payload['error']) && isset($payload['error']['message'])) {
+                return (string) $payload['error']['message'];
+            }
             foreach (['Error', 'error', 'message', 'detail'] as $key) {
-                if (!empty($payload[$key])) {
+                if (!empty($payload[$key]) && is_scalar($payload[$key])) {
                     return (string) $payload[$key];
                 }
             }
