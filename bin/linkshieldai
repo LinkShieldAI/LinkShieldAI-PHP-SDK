@@ -27,9 +27,7 @@ function usage(): string
 {
     return <<<TEXT
 Usage:
-  linkshieldai [--api-key KEY] [--base-url URL] [--timeout SECONDS] [--max-retries N] scan <url> [--mode standard|detailed|deep]
-  linkshieldai [--api-key KEY] [--base-url URL] [--timeout SECONDS] [--max-retries N] basic <url>
-  linkshieldai [--api-key KEY] [--base-url URL] [--timeout SECONDS] [--max-retries N] detailed <url>
+  linkshieldai [--api-key KEY] [--base-url URL] [--timeout SECONDS] [--max-retries N] scan <url> [--mode standard|detailed|deep] [--ai] [--include-signals]
   linkshieldai [--api-key KEY] [--base-url URL] [--timeout SECONDS] [--max-retries N] nsfw <url>
   linkshieldai [--api-key KEY] [--base-url URL] [--timeout SECONDS] [--max-retries N] chimera <url>
   linkshieldai [--api-key KEY] [--base-url URL] [--timeout SECONDS] [--max-retries N] screenshot <fileOrUrl> --output <path>
@@ -37,7 +35,7 @@ TEXT;
 }
 
 /**
- * @return array{command: ?string, apiKey: ?string, baseUrl: string, timeout: float, maxRetries: int, mode: string, output: ?string, target: ?string, help: bool}
+ * @return array{command: ?string, apiKey: ?string, baseUrl: string, timeout: float, maxRetries: int, output: ?string, target: ?string, help: bool}
  */
 function parse_args(array $argv): array
 {
@@ -47,7 +45,6 @@ function parse_args(array $argv): array
         'baseUrl' => Client::DEFAULT_BASE_URL,
         'timeout' => 10.0,
         'maxRetries' => 2,
-        'mode' => 'standard',
         'output' => null,
         'target' => null,
         'help' => false,
@@ -71,12 +68,16 @@ function parse_args(array $argv): array
         } elseif ($arg === '--max-retries') {
             $args['maxRetries'] = (int) $next;
             $i++;
-        } elseif ($arg === '--mode') {
-            $args['mode'] = $next ?? '';
-            $i++;
         } elseif ($arg === '--output' || $arg === '-o') {
             $args['output'] = $next;
             $i++;
+        } elseif ($arg === '--mode') {
+            $args['mode'] = $next ?? 'standard';
+            $i++;
+        } elseif ($arg === '--ai') {
+            $args['ai'] = true;
+        } elseif ($arg === '--include-signals') {
+            $args['includeSignals'] = true;
         } else {
             $positionals[] = $arg;
         }
@@ -112,14 +113,13 @@ try {
         throw new InvalidArgumentException('Missing URL or screenshot file.');
     }
 
-    if (!in_array($args['mode'], ['standard', 'detailed', 'deep'], true)) {
-        throw new InvalidArgumentException('Scan mode must be standard, detailed, or deep.');
-    }
-
     $result = match ($command) {
-        'scan' => $client->scan($target, $args['mode']),
-        'basic' => $client->basicCheck($target),
-        'detailed' => $client->detailedCheck($target),
+        'scan' => $client->scan(
+            $target,
+            $args['mode'] ?? 'standard',
+            (bool) ($args['ai'] ?? false),
+            (bool) ($args['includeSignals'] ?? false),
+        ),
         'nsfw' => $client->nsfwCheck($target),
         'chimera' => $client->chimera($target),
         'screenshot' => (function () use ($client, $target, $args): array {

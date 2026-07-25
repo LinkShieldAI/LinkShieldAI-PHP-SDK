@@ -10,14 +10,16 @@ use LinkShieldAI\Exception\ApiStatusException;
 use LinkShieldAI\Exception\AuthenticationException;
 use LinkShieldAI\Exception\LinkShieldAIException;
 use LinkShieldAI\Exception\RateLimitException;
-use LinkShieldAI\Result\BasicCheckResult;
 use LinkShieldAI\Result\ChimeraResult;
-use LinkShieldAI\Result\DetailedCheckResult;
 use LinkShieldAI\Result\NsfwCheckResult;
+use LinkShieldAI\Result\ScanResult;
+use LinkShieldAI\Result\ScanSignals;
 
 final class Client
 {
     public const DEFAULT_BASE_URL = 'https://api.linkshieldai.com';
+
+    public const SCAN_MODES = ['standard', 'detailed', 'deep'];
 
     /**
      * @var callable(string, string, array<string, string>, float): HttpResponse|null
@@ -38,16 +40,24 @@ final class Client
         $this->transport = $transport;
     }
 
-    public function basicCheck(string $url): BasicCheckResult
+    /**
+     * Scan a URL with POST /v1/scan.
+     *
+     * $mode is 'standard', 'detailed' or 'deep'. $ai adds model analysis; it
+     * applies to deep mode only and is off by default. $includeSignals returns
+     * the raw per-source signals behind the verdict.
+     */
+    public function scan(string $url, string $mode = 'standard', bool $ai = false, bool $includeSignals = false): ScanResult
     {
-        $payload = $this->getJson('/', ['url' => $url]);
-        return $this->parseBasic($payload);
-    }
+        $body = ['url' => $url, 'mode' => $this->validateMode($mode)];
+        if ($ai) {
+            $body['ai'] = true;
+        }
+        if ($includeSignals) {
+            $body['include_signals'] = true;
+        }
 
-    public function detailedCheck(string $url): DetailedCheckResult
-    {
-        $payload = $this->getJson('/classify_link', ['url' => $url]);
-        return $this->parseDetailed($payload);
+        return $this->parseScan($this->postJson('/v1/scan', $body));
     }
 
     public function nsfwCheck(string $url): NsfwCheckResult
@@ -62,27 +72,20 @@ final class Client
         return $this->parseChimera($payload);
     }
 
-    /** @return array<string, mixed> Stable /v1/scan response. */
-    public function scan(string $url, string $mode = 'standard'): array
-    {
-        if (!in_array($mode, ['standard', 'detailed', 'deep'], true)) {
-            throw new \InvalidArgumentException('Scan mode must be standard, detailed, or deep.');
-        }
-        $body = json_encode(['url' => $url, 'mode' => $mode], JSON_THROW_ON_ERROR);
-        $response = $this->request('POST', '/v1/scan', [], [
-            'Authorization' => 'Bearer ' . $this->resolvedApiKey(),
-            'Content-Type' => 'application/json',
-        ], $body);
-        $payload = json_decode($response->body, true, flags: JSON_THROW_ON_ERROR);
-        if (!is_array($payload) || array_is_list($payload)) {
-            throw new ApiResponseException('LinkShieldAI API returned a non-object JSON response.', $payload);
-        }
-        return $payload;
-    }
-
+    /** True only for an explicit MALICIOUS verdict. UNKNOWN is not safe. */
     public function isMalicious(string $url): bool
     {
-        return $this->basicCheck($url)->isMalicious;
+        return $this->scan($url)->isMalicious();
+    }
+
+    private function validateMode(string $mode): string
+    {
+        $normalized = strtolower(trim($mode));
+        if (!in_array($normalized, self::SCAN_MODES, true)) {
+            throw new \InvalidArgumentException('mode must be one of ' . implode(', ', self::SCAN_MODES) . "; got {$mode}");
+        }
+
+        return $normalized;
     }
 
     public function isNsfw(string $url): bool
@@ -93,9 +96,7 @@ final class Client
     public function getScreenshot(string $fileNameOrUrl, ?string $outputPath = null): string
     {
         $fileName = $this->screenshotFileName($fileNameOrUrl);
-        $response = $this->request('GET', '/screenshot/' . rawurlencode($fileName), [], [
-            'Authorization' => 'Bearer ' . $this->resolvedApiKey(),
-        ]);
+        $response = $this->request('GET', '/screenshot/' . rawurlencode($fileName));
         $content = $response->body;
 
         if ($outputPath !== null) {
@@ -114,7 +115,23 @@ final class Client
      */
     private function getJson(string $path, array $params): array
     {
-        $response = $this->request('GET', $path, $params, ['Authorization' => 'Bearer ' . $this->resolvedApiKey()]);
+        return $this->decodeJson($this->request('GET', $path, $params));
+    }
+
+    /**
+     * @param array<string, mixed> $body
+     * @return array<string, mixed>
+     */
+    private function postJson(string $path, array $body): array
+    {
+        return $this->decodeJson($this->request('POST', $path, [], $body));
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function decodeJson(HttpResponse $response): array
+    {
         $payload = json_decode($response->body, true);
 
         if (json_last_error() !== JSON_ERROR_NONE) {
@@ -141,17 +158,25 @@ final class Client
     /**
      * @param array<string, string> $params
      */
-    private function request(string $method, string $path, array $params = [], array $headers = [], ?string $body = null): HttpResponse
+    private function request(string $method, string $path, array $params = [], ?array $body = null): HttpResponse
     {
         $url = rtrim($this->baseUrl, '/') . $path;
         if ($params !== []) {
             $url .= '?' . http_build_query($params, '', '&', PHP_QUERY_RFC3986);
         }
 
+        // The API key travels in the Authorization header, never the query.
+        $headers = ['Authorization' => 'Bearer ' . $this->resolvedApiKey()];
+        $encodedBody = null;
+        if ($body !== null) {
+            $headers['Content-Type'] = 'application/json';
+            $encodedBody = json_encode($body, JSON_THROW_ON_ERROR);
+        }
+
         $maxRetries = max(0, $this->maxRetries);
         for ($attempt = 0; $attempt <= $maxRetries; $attempt++) {
             try {
-                $response = $this->send($method, $url, $headers, $body);
+                $response = $this->send($method, $url, $headers, $encodedBody);
             } catch (LinkShieldAIException $exception) {
                 throw $exception;
             } catch (\Throwable $exception) {
@@ -174,6 +199,9 @@ final class Client
         throw new ApiConnectionException('Could not connect to LinkShieldAI API after retries.');
     }
 
+    /**
+     * @param array<string, string> $headers
+     */
     private function send(string $method, string $url, array $headers = [], ?string $body = null): HttpResponse
     {
         if ($this->transport !== null) {
@@ -187,7 +215,24 @@ final class Client
         return $this->sendWithStream($method, $url, $headers, $body);
     }
 
-    private function sendWithCurl(string $method, string $url, array $requestHeaders = [], ?string $requestBody = null): HttpResponse
+    /**
+     * @param array<string, string> $headers
+     * @return list<string>
+     */
+    private function headerLines(array $headers): array
+    {
+        $lines = [];
+        foreach ($headers as $name => $value) {
+            $lines[] = $name . ': ' . $value;
+        }
+
+        return $lines;
+    }
+
+    /**
+     * @param array<string, string> $requestHeaders
+     */
+    private function sendWithCurl(string $method, string $url, array $requestHeaders = [], ?string $body = null): HttpResponse
     {
         $headers = [];
         $handle = curl_init($url);
@@ -207,9 +252,12 @@ final class Client
                 return $length;
             },
             CURLOPT_TIMEOUT => $this->timeout,
-            CURLOPT_HTTPHEADER => array_map(static fn(string $name, string $value): string => $name . ': ' . $value, array_keys($requestHeaders), $requestHeaders),
-            CURLOPT_POSTFIELDS => $requestBody,
+            CURLOPT_HTTPHEADER => $this->headerLines($requestHeaders),
         ]);
+
+        if ($body !== null) {
+            curl_setopt($handle, CURLOPT_POSTFIELDS, $body);
+        }
 
         $body = curl_exec($handle);
         if ($body === false) {
@@ -224,17 +272,24 @@ final class Client
         return new HttpResponse($statusCode, (string) $body, $headers);
     }
 
+    /**
+     * @param array<string, string> $requestHeaders
+     */
     private function sendWithStream(string $method, string $url, array $requestHeaders = [], ?string $requestBody = null): HttpResponse
     {
-        $context = stream_context_create([
-            'http' => [
-                'method' => $method,
-                'timeout' => $this->timeout,
-                'ignore_errors' => true,
-                'header' => implode("\r\n", array_map(static fn(string $name, string $value): string => $name . ': ' . $value, array_keys($requestHeaders), $requestHeaders)),
-                'content' => $requestBody ?? '',
-            ],
-        ]);
+        $options = [
+            'method' => $method,
+            'timeout' => $this->timeout,
+            'ignore_errors' => true,
+            'header' => implode("
+
+", $this->headerLines($requestHeaders)),
+        ];
+        if ($requestBody !== null) {
+            $options['content'] = $requestBody;
+        }
+
+        $context = stream_context_create(['http' => $options]);
 
         $body = @file_get_contents($url, false, $context);
         if ($body === false) {
@@ -290,11 +345,8 @@ final class Client
     private function errorMessageFromPayload(?array $payload, string $fallback = 'LinkShieldAI API request failed.'): string
     {
         if ($payload !== null) {
-            if (isset($payload['error']) && is_array($payload['error']) && isset($payload['error']['message'])) {
-                return (string) $payload['error']['message'];
-            }
             foreach (['Error', 'error', 'message', 'detail'] as $key) {
-                if (!empty($payload[$key]) && is_scalar($payload[$key])) {
+                if (!empty($payload[$key])) {
                     return (string) $payload[$key];
                 }
             }
@@ -322,32 +374,71 @@ final class Client
     /**
      * @param array<string, mixed> $payload
      */
-    private function parseBasic(array $payload): BasicCheckResult
+    private function parseScan(array $payload): ScanResult
     {
-        $result = $payload['result'] ?? null;
-        return new BasicCheckResult(
-            result: $result === null ? null : (string) $result,
-            isMalicious: $this->isMaliciousText($result),
-            isSafe: $this->isSafeText($result),
+        $urlBlock = is_array($payload['url'] ?? null) ? $payload['url'] : [];
+
+        return new ScanResult(
+            verdict: strtoupper((string) ($payload['verdict'] ?? 'UNKNOWN')),
+            requestId: $this->stringOrNull($payload['request_id'] ?? null),
+            mode: $this->stringOrNull($payload['mode'] ?? null),
+            confidence: $this->floatOrNull($payload['confidence'] ?? null),
+            riskScore: $this->floatOrNull($payload['risk_score'] ?? null),
+            threatCategories: $this->stringList($payload['threat_categories'] ?? null),
+            reasonCodes: $this->stringList($payload['reason_codes'] ?? null),
+            brandTarget: $this->stringOrNull($payload['brand_target'] ?? null),
+            screenshotUrl: $this->stringOrNull($payload['screenshot_url'] ?? null),
+            submittedUrl: $this->stringOrNull($urlBlock['submitted'] ?? null),
+            normalizedUrl: $this->stringOrNull($urlBlock['normalized'] ?? null),
+            redirects: $this->stringList($urlBlock['redirects'] ?? null),
+            scannedAt: $this->stringOrNull($payload['scanned_at'] ?? null),
+            freshness: $this->stringOrNull($payload['freshness'] ?? null),
+            engineVersion: $this->stringOrNull($payload['engine_version'] ?? null),
+            signals: $this->parseSignals($payload['signals'] ?? null),
             raw: $payload,
         );
     }
 
-    /**
-     * @param array<string, mixed> $payload
-     */
-    private function parseDetailed(array $payload): DetailedCheckResult
+    private function parseSignals(mixed $payload): ?ScanSignals
     {
-        $result = $payload['result'] ?? null;
-        $screenshotUrl = $payload['screenshot url'] ?? $payload['screenshot_url'] ?? $payload['screenshotUrl'] ?? null;
+        if (!is_array($payload)) {
+            return null;
+        }
 
-        return new DetailedCheckResult(
-            result: $result === null ? null : (string) $result,
-            screenshotUrl: $screenshotUrl ? (string) $screenshotUrl : null,
-            tag: array_key_exists('tag', $payload) && $payload['tag'] !== null ? (string) $payload['tag'] : null,
-            isMalicious: $this->isMaliciousText($result),
+        $allowlist = is_array($payload['allowlist'] ?? null) ? $payload['allowlist'] : [];
+
+        return new ScanSignals(
+            urlReputation: (string) ($payload['url_reputation'] ?? 'unknown'),
+            domainReputation: (string) ($payload['domain_reputation'] ?? 'unknown'),
+            threatFeed: (string) ($payload['threat_feed'] ?? 'unknown'),
+            externalReputation: (bool) ($payload['external_reputation'] ?? false),
+            fandom: (bool) ($allowlist['fandom'] ?? false),
+            carrd: (bool) ($allowlist['carrd'] ?? false),
+            degraded: (bool) ($payload['degraded'] ?? false),
             raw: $payload,
         );
+    }
+
+    private function stringOrNull(mixed $value): ?string
+    {
+        return $value === null ? null : (string) $value;
+    }
+
+    private function floatOrNull(mixed $value): ?float
+    {
+        return is_numeric($value) ? (float) $value : null;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function stringList(mixed $value): array
+    {
+        if (!is_array($value)) {
+            return [];
+        }
+
+        return array_values(array_map(static fn ($item): string => (string) $item, $value));
     }
 
     /**
